@@ -1,0 +1,384 @@
+#include <iostream>
+#include <vector>
+#include <queue>
+#include <iomanip>
+#include <algorithm>
+#include <fstream>
+#include <string>
+#include <set> 
+#include <limits> 
+#include <sstream> // Cần thêm thư viện này để xây dựng chuỗi chi tiết
+
+using namespace std;
+
+// ======================= Cấu trúc dữ liệu =======================
+struct TienTrinh {
+    int ma = -1;
+    int den = 0;
+    int tongXuLy = 0;
+    int io_burst_point = 0;
+    int io_duration = 0;
+
+    int conLai = 0;
+    int xuLyDaXong = 0;
+    bool io_completed = false;
+
+    int batDauLanDau = -1;
+    int hoanThanh = 0;
+    int quayVong = 0;
+    int cho = 0;
+    int phanHoi = 0;
+
+    // THÊM: Các trường cần thiết để tính WT chi tiết
+    int thoiDiemVaoRQ = -1; // Thời điểm gần nhất tiến trình vào Ready Queue
+    int tongThoiGianChoChiTiet = 0;
+    string waitingTimeDetails; // Chuỗi lưu chi tiết (X-Y) + (A-B)
+};
+
+// Cấu trúc cho sự kiện I/O
+struct IoEvent {
+    int return_time;
+    int pid_index;
+
+    bool operator<(const IoEvent& other) const {
+        if (return_time != other.return_time) {
+            return return_time < other.return_time;
+        }
+        return pid_index < other.pid_index;
+    }
+};
+
+struct Gantt {
+    int batDau, ketThuc;
+    int pid;
+};
+
+template<typename T>
+void xuat(ofstream& fout, const T& val) {
+    cout << val;
+    fout << val;
+}
+
+// ======================= Chương trình chính =======================
+int main() {
+    ifstream fin("input.txt");
+    ofstream fout("output.txt");
+
+    if (!fin.is_open()) { cerr << "Loi: Khong mo duoc file input.txt.\n"; return 1; }
+    if (!fout.is_open()) { cerr << "Loi: Khong mo duoc file output.txt.\n"; return 1; }
+
+    int n;
+    if (!(fin >> n) || n <= 0) { cerr << "Loi doc so tien trinh (n).\n"; return 1; }
+    vector<TienTrinh> ds(n);
+
+    for (int i = 0; i < n; ++i) {
+        ds[i].ma = i;
+        if (!(fin >> ds[i].den >> ds[i].tongXuLy >> ds[i].io_burst_point >> ds[i].io_duration)) {
+            cerr << "Loi doc du lieu tien trinh P" << i + 1 << ".\n"; return 1;
+        }
+        ds[i].conLai = ds[i].tongXuLy;
+    }
+
+    int quantum;
+    if (!(fin >> quantum) || quantum <= 0) { cerr << "Loi doc quantum (q).\n"; return 1; }
+
+    sort(ds.begin(), ds.end(), [](const TienTrinh& a, const TienTrinh& b) {
+        if (a.den != b.den) return a.den < b.den;
+        return a.ma < b.ma;
+        });
+
+    // =================== In thông tin đầu vào (Tiếng Việt) ===================
+    xuat(fout, "So tien trinh: "); xuat(fout, n); xuat(fout, "\n");
+    xuat(fout, "Quantum: "); xuat(fout, quantum); xuat(fout, "\n\n");
+    xuat(fout, "===== Danh sach tien trinh =====\n");
+
+    // Tiêu đề cột dùng Tiếng Việt và căn chỉnh
+    xuat(fout, "+------------+--------------------+---------------+--------------+---------------+\n");
+    xuat(fout, "| Tien trinh | Thoi diem vao RL   | Thoi gian CPU | Thoi diem I/O| Thoi gian I/O |\n");
+    xuat(fout, "+------------+--------------------+---------------+--------------+---------------+\n");
+
+    // Căn chỉnh dữ liệu
+    for (auto& tt : ds) {
+        // Sử dụng setw lớn hơn để căn giữa tiêu đề và dữ liệu
+        cout << "| P" << left << setw(10) << tt.ma + 1 << "| " << setw(19) << tt.den
+            << "| " << setw(14) << tt.tongXuLy << "| " << setw(13) << tt.io_burst_point
+            << "| " << setw(14) << tt.io_duration << "|\n";
+        fout << "| P" << left << setw(10) << tt.ma + 1 << "| " << setw(19) << tt.den
+            << "| " << setw(14) << tt.tongXuLy << "| " << setw(13) << tt.io_burst_point
+            << "| " << setw(14) << tt.io_duration << "|\n";
+    }
+    xuat(fout, "+------------+--------------------+---------------+--------------+---------------+\n\n");
+
+
+    // =================== Round Robin với I/O (Logic Chính) ===================
+    vector<TienTrinh> processes = ds;
+    queue<int> ready_queue;
+    multiset<IoEvent> io_events;
+
+    int thoiGian = 0;
+    int chiSo = 0;
+    int daXong = 0;
+    vector<Gantt> gantt;
+
+    if (processes[0].den > 0) thoiGian = processes[0].den;
+
+    // Hàm để đẩy tiến trình vào RQ và ghi lại thời điểm
+    auto push_to_ready_queue = [&](int p_idx, int arrival_time) {
+        ready_queue.push(p_idx);
+        processes[p_idx].thoiDiemVaoRQ = arrival_time;
+        };
+
+
+    while (daXong < n) {
+
+        // 1. Cập nhật Ready Queue từ IO Return và Arrival (T=thoiGian)
+        while (!io_events.empty() && io_events.begin()->return_time <= thoiGian) {
+            auto it = io_events.begin();
+            int p_idx = it->pid_index;
+            int return_time = it->return_time;
+            io_events.erase(it);
+            if (processes[p_idx].conLai > 0) {
+                push_to_ready_queue(p_idx, return_time); // IO xong
+            }
+        }
+        while (chiSo < n && processes[chiSo].den <= thoiGian) {
+            push_to_ready_queue(chiSo, processes[chiSo].den); // Đến
+            chiSo++;
+        }
+
+        // 2. Xử lý Idle / Time Jump
+        if (ready_queue.empty()) {
+            int next_event_time = -1;
+
+            if (chiSo < n) next_event_time = processes[chiSo].den;
+
+            if (!io_events.empty()) {
+                int next_io_time = io_events.begin()->return_time;
+                if (next_event_time == -1 || (next_io_time != -1 && next_io_time < next_event_time)) {
+                    next_event_time = next_io_time;
+                }
+            }
+
+            if (next_event_time != -1 && next_event_time > thoiGian) {
+                gantt.push_back({ thoiGian, next_event_time, -1 }); // Idle
+                thoiGian = next_event_time;
+                continue;
+            }
+            else if (next_event_time == -1 && daXong < n) {
+                if (io_events.empty() && chiSo >= n) break;
+            }
+        }
+
+        // 3. Thực thi CPU
+        if (!ready_queue.empty()) {
+            int hienTai = ready_queue.front(); ready_queue.pop();
+
+            // TÍNH TOÁN VÀ GHI LẠI THỜI GIAN CHỜ CHI TIẾT
+            if (processes[hienTai].thoiDiemVaoRQ != -1) {
+                int thoiDiemRaRQ = thoiGian;
+                int thoiDiemVaoRQ = processes[hienTai].thoiDiemVaoRQ;
+                int khoangCho = thoiDiemRaRQ - thoiDiemVaoRQ;
+
+                // Cộng tổng thời gian chờ chi tiết
+                processes[hienTai].tongThoiGianChoChiTiet += khoangCho;
+
+                // Ghi lại chi tiết phép tính
+                stringstream ss;
+                if (!processes[hienTai].waitingTimeDetails.empty()) {
+                    ss << processes[hienTai].waitingTimeDetails << " + ";
+                }
+                ss << "(" << thoiDiemRaRQ << "-" << thoiDiemVaoRQ << ")";
+                processes[hienTai].waitingTimeDetails = ss.str();
+
+                processes[hienTai].thoiDiemVaoRQ = -1; // Đặt lại sau khi bắt đầu chạy
+            }
+
+
+            int chayMax = quantum;
+
+            // Tính toán thời gian chạy tối đa đến Burst I/O
+            if (processes[hienTai].io_duration > 0 &&
+                !processes[hienTai].io_completed &&
+                processes[hienTai].xuLyDaXong < processes[hienTai].io_burst_point) {
+
+                int canChayToiIO = processes[hienTai].io_burst_point - processes[hienTai].xuLyDaXong;
+                chayMax = min(quantum, canChayToiIO);
+            }
+
+            // Đảm bảo không chạy quá thời gian còn lại (KEY FIX)
+            int chay = min(chayMax, processes[hienTai].conLai);
+
+            int batDau = thoiGian;
+            thoiGian += chay;
+            processes[hienTai].conLai -= chay;
+            processes[hienTai].xuLyDaXong += chay;
+
+            if (processes[hienTai].batDauLanDau == -1) {
+                processes[hienTai].batDauLanDau = batDau;
+            }
+
+            gantt.push_back({ batDau, thoiGian, processes[hienTai].ma + 1 });
+
+            // 4. Xử lý trạng thái sau khi chạy
+
+            // Cập nhật Arrival/IO return trong khoảng thời gian vừa chạy (thoiGian)
+            while (chiSo < n && processes[chiSo].den <= thoiGian) { push_to_ready_queue(chiSo, processes[chiSo].den); chiSo++; }
+            while (!io_events.empty() && io_events.begin()->return_time <= thoiGian) {
+                auto it = io_events.begin();
+                int p_idx = it->pid_index;
+                int return_time = it->return_time;
+                io_events.erase(it);
+                if (processes[p_idx].conLai > 0) {
+                    push_to_ready_queue(p_idx, return_time);
+                }
+            }
+
+            if (processes[hienTai].conLai == 0) {
+                processes[hienTai].hoanThanh = thoiGian;
+                daXong++;
+            }
+            // Kiểm tra I/O Burst Point
+            else if (processes[hienTai].io_duration > 0 &&
+                processes[hienTai].xuLyDaXong == processes[hienTai].io_burst_point &&
+                !processes[hienTai].io_completed) {
+
+                int return_time = thoiGian + processes[hienTai].io_duration;
+                io_events.insert({ return_time, hienTai });
+                processes[hienTai].io_completed = true;
+            }
+            else {
+                // Bị Preempt (hết quantum) -> Đưa lại vào RQ
+                push_to_ready_queue(hienTai, thoiGian);
+            }
+        }
+    }
+
+    // =================== Xuất Biểu đồ Gantt ===================
+    vector<Gantt> merged_gantt;
+    if (!gantt.empty()) {
+        merged_gantt.push_back(gantt[0]);
+        for (size_t i = 1; i < gantt.size(); ++i) {
+            if (gantt[i].pid == merged_gantt.back().pid) {
+                merged_gantt.back().ketThuc = gantt[i].ketThuc;
+            }
+            else {
+                merged_gantt.push_back(gantt[i]);
+            }
+        }
+    }
+
+    xuat(fout, "===== Bieu do Gantt (CPU Time) =====\n");
+    for (auto& g : merged_gantt) {
+        int doDai = g.ketThuc - g.batDau;
+        if (doDai <= 0) continue;
+        if (g.pid == -1) {
+            cout << "| Idle" << string(max(0, doDai * 2 - 4), ' ');
+            fout << "| Idle" << string(max(0, doDai * 2 - 4), ' ');
+        }
+        else {
+            cout << "| P" << g.pid << string(max(0, doDai * 2 - 2), ' ');
+            fout << "| P" << g.pid << string(max(0, doDai * 2 - 2), ' ');
+        }
+    }
+    cout << "|\n"; fout << "|\n";
+
+    for (auto& g : merged_gantt) {
+        int doDai = g.ketThuc - g.batDau;
+        if (doDai <= 0) continue;
+        cout << setw(2) << g.batDau << string(doDai * 2, ' ');
+        fout << setw(2) << g.batDau << string(doDai * 2, ' ');
+    }
+    if (!merged_gantt.empty()) {
+        cout << setw(2) << merged_gantt.back().ketThuc << "\n\n";
+        fout << setw(2) << merged_gantt.back().ketThuc << "\n\n";
+    }
+
+    // =================== Xuất Kết quả Chi tiết (7 Cột) ===================
+    double tongTAT = 0, tongWT = 0;
+
+    sort(processes.begin(), processes.end(), [](const TienTrinh& a, const TienTrinh& b) {
+        return a.ma < b.ma;
+        });
+
+    xuat(fout, "===== Bang ket qua chi tiet =====\n");
+    // Tiêu đề cột dùng Tiếng Việt và căn chỉnh (Chỉ 7 cột)
+    xuat(fout, "+------------+--------------------+---------------+--------------+---------------+----------+------------+\n");
+    xuat(fout, "| Tien trinh | Thoi diem vao RL   | Thoi gian CPU | Thoi diem I/O| Thoi gian I/O | Bat dau  | Hoan thanh |\n");
+    xuat(fout, "+------------+--------------------+---------------+--------------+---------------+----------+------------+\n");
+
+    // Đặt độ rộng cố định cho các cột
+    const int W_PID = 12; // Tiến trình
+    const int W_DEN = 20; // Thời điểm vào RL
+    const int W_CPU = 15; // Thời gian CPU
+    const int W_BIO = 14; // Thời điểm I/O
+    const int W_IOD = 15; // Thời gian I/O
+    const int W_BD = 10;  // Bắt đầu
+    const int W_HOAN = 12; // Hoàn thành
+
+    for (auto& tt : processes) {
+        // Tính toán các chỉ số (vẫn phải tính để có tổng TAT/WT)
+        tt.quayVong = tt.hoanThanh - tt.den;
+        // Sử dụng WT chi tiết để tính tổng WT
+        tt.cho = tt.tongThoiGianChoChiTiet;
+        tt.phanHoi = tt.batDauLanDau - tt.den;
+
+        tongTAT += tt.quayVong;
+        tongWT += tt.cho;
+
+        // 3. In ra Console và File 
+
+        // Console Output (Đã loại bỏ TAT/WT)
+        cout << "| P" << left << setw(W_PID - 2) << tt.ma + 1
+            << "| " << setw(W_DEN - 1) << tt.den
+            << "| " << setw(W_CPU - 1) << tt.tongXuLy
+            << "| " << setw(W_BIO - 1) << tt.io_burst_point
+            << "| " << setw(W_IOD - 1) << tt.io_duration
+            << "| " << setw(W_BD - 1) << tt.batDauLanDau
+            << "| " << setw(W_HOAN - 1) << tt.hoanThanh
+            << "|\n";
+
+        // File Output (Đã loại bỏ TAT/WT)
+        fout << "| P" << left << setw(W_PID - 2) << tt.ma + 1
+            << "| " << setw(W_DEN - 1) << tt.den
+            << "| " << setw(W_CPU - 1) << tt.tongXuLy
+            << "| " << setw(W_BIO - 1) << tt.io_burst_point
+            << "| " << setw(W_IOD - 1) << tt.io_duration
+            << "| " << setw(W_BD - 1) << tt.batDauLanDau
+            << "| " << setw(W_HOAN - 1) << tt.hoanThanh
+            << "|\n";
+    }
+    xuat(fout, "+------------+--------------------+---------------+--------------+---------------+----------+------------+\n");
+
+    // =================== Phần Chi tiết Từng Khoảng Chờ (YÊU CẦU CỦA BẠN) ===================
+    xuat(fout, "\n===== Chi tiet Thoi gian Cho (Waiting Time Details) =====\n");
+    for (auto& tt : processes) {
+        xuat(fout, "P"); xuat(fout, tt.ma + 1);
+        xuat(fout, " = ");
+
+        // Chỉ in chi tiết nếu có
+        if (tt.waitingTimeDetails.empty()) {
+            xuat(fout, "0"); // Trường hợp không có thời gian chờ (P = 0)
+        }
+        else {
+            xuat(fout, tt.waitingTimeDetails);
+            xuat(fout, " = "); xuat(fout, tt.tongThoiGianChoChiTiet);
+        }
+        xuat(fout, "\n");
+    }
+    xuat(fout, "\n");
+
+
+    // =================== TAT/WT Tổng hợp ===================
+    cout << fixed << setprecision(2);
+    fout << fixed << setprecision(2);
+
+    xuat(fout, "\nTong TAT = "); xuat(fout, tongTAT);
+    xuat(fout, "\nTong WT (Chi tiet) = "); xuat(fout, tongWT);
+    xuat(fout, "\n- TAT trung binh = "); xuat(fout, (tongTAT / n));
+    xuat(fout, "\n- WT trung binh (Chi tiet) = "); xuat(fout, (tongWT / n));
+    xuat(fout, "\n");
+
+    fin.close();
+    fout.close();
+    return 0;
+}
